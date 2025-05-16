@@ -1,0 +1,7 @@
+# Python cache and virtual env
+__pycache__/
+*.py[cod]
+*.env
+my_env/
+node_modules/
+*.log
