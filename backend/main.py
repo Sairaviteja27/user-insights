@@ -1,17 +1,32 @@
 import os
+import json
+import logging
+import re
 from typing import Dict
+from hashlib import sha256
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
+from cachetools import TTLCache
 import praw
-import json
+
 from langchain_openai import AzureChatOpenAI
 from langchain.prompts import ChatPromptTemplate, SystemMessagePromptTemplate, HumanMessagePromptTemplate
 
 # Load environment variables
 load_dotenv()
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler("error.log"),
+        logging.StreamHandler()
+    ]
+)
 
 # Initialize FastAPI
 app = FastAPI()
@@ -52,52 +67,102 @@ You are a psychologist AI assistant. Analyze the user's Reddit activity and retu
 
 Use the user's writing style, interests, tone, and emotional cues to infer personality. Do not guess randomly or use defaults.
 
-Respond only with a valid JSON object.
+Respond only with a valid JSON object. Do not include markdown formatting like ```json.
 """
-
-
 
 prompt = ChatPromptTemplate.from_messages([
     SystemMessagePromptTemplate.from_template(SYSTEM_PROMPT),
     HumanMessagePromptTemplate.from_template("Reddit activity:\n\n{input}")
 ])
 
-# Request body model
+# Cache setup
+cache = TTLCache(maxsize=500, ttl=86400)
+
+# Request model
 class AnalyzeRequest(BaseModel):
     username: str
     limit: int = 10
 
-# Route to analyze Reddit activity
+def is_safe(text: str) -> bool:
+    banned_keywords = ['sex', 'porn', 'nsfw', 'fetish', 'nude', 'xxx', 'horny']
+    return not any(word in text.lower() for word in banned_keywords)
+
 @app.post("/analyze")
 def analyze_user(request: AnalyzeRequest):
     try:
+        cache_key = sha256(request.username.strip().lower().encode()).hexdigest()
+
+        if cache_key in cache:
+            logging.info(f"Cache hit for {request.username}")
+            return cache[cache_key]
+
+        logging.info(f"Fetching Reddit activity for user: {request.username}")
         user = reddit.redditor(request.username)
-        texts = []
+        posts = []
+        comments = []
 
         for submission in user.submissions.new(limit=request.limit):
-            texts.append(f"Post: {submission.title}\n{submission.selftext or ''}")
+            if not submission.over_18:
+                posts.append({
+                    "title": submission.title,
+                    "selftext": submission.selftext or "",
+                    "url": submission.url,
+                    "created_utc": submission.created_utc
+                })
 
         for comment in user.comments.new(limit=request.limit):
-            texts.append(f"Comment: {comment.body}")
+            if not comment.subreddit.over18:
+                comments.append({
+                    "body": comment.body,
+                    "link_permalink": comment.permalink,
+                    "created_utc": comment.created_utc
+                })
 
-        combined_text = "\n\n".join(texts)
+        # Filter the content further by keyword if needed
+        combined_text = "\n\n".join(
+            [f"Post: {p['title']}\n{p['selftext']}" for p in posts if is_safe(p['title'] + p['selftext'])] +
+            [f"Comment: {c['body']}" for c in comments if is_safe(c['body'])]
+        )
 
         if not combined_text.strip():
-            raise HTTPException(status_code=404, detail="No user activity found.")
+            logging.warning(f"No SFW content found for user: {request.username}")
+            raise HTTPException(status_code=404, detail="No SFW user activity found.")
 
         chain = prompt | llm
-        result = chain.invoke({"input": combined_text})
-
-        # parse JSON returned by GPT
         try:
-            parsed = json.loads(result.content)
-        except json.JSONDecodeError:
+            result = chain.invoke({"input": combined_text})
+        except Exception as e:
+            logging.error(f"OpenAI error for user {request.username}: {str(e)}")
+            if "content_filter" in str(e):
+                raise HTTPException(
+                    status_code=400,
+                    detail="OpenAI flagged the content as inappropriate. Try a different user."
+                )
+            raise
+
+        # Remove markdown-style wrapping if present
+        clean_json = re.sub(r"^```(?:json)?|```$", "", result.content.strip(), flags=re.MULTILINE).strip()
+
+        try:
+            parsed = json.loads(clean_json)
+        except json.JSONDecodeError as e:
+            logging.error(f"Invalid JSON from GPT for {request.username}: {result.content}")
             raise HTTPException(status_code=500, detail="Invalid JSON returned by GPT.")
 
-        return {
+        response = {
             "username": request.username,
-            **parsed
+            **parsed,
+            "posts": posts,
+            "comments": comments
         }
 
+        cache[cache_key] = response
+        logging.info(f"Analysis completed and cached for user: {request.username}")
+        return response
+
+    except HTTPException as e:
+        logging.warning(f"Handled error for user {request.username}: {e.detail}")
+        raise e
     except Exception as e:
+        logging.exception(f"Unhandled error analyzing user {request.username}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error analyzing user: {str(e)}")
